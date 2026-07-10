@@ -18,6 +18,10 @@ DATA_DIR = os.path.join(BASE_DIR, 'data')
 UPLOAD_DIR = os.path.join(DATA_DIR, 'uploads')
 DB_PATH = os.path.join(DATA_DIR, 'site.db')
 
+# === Security ===
+RATE_LIMIT = {}  # {ip: [timestamps]}
+DOWNLOAD_LOG = []  # Recent download records
+
 MIME_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -219,6 +223,19 @@ def page_footer():
 
 # === HTTP Handler ===
 class CFIHandler(BaseHTTPRequestHandler):
+  def _check_rate_limit(self):
+    ip = self.client_address[0]
+    now = time.time()
+    # Clean old entries (older than 60s)
+    if ip in RATE_LIMIT:
+      RATE_LIMIT[ip] = [t for t in RATE_LIMIT[ip] if now - t < 60]
+    else:
+      RATE_LIMIT[ip] = []
+    if len(RATE_LIMIT[ip]) >= 60:
+      return False
+    RATE_LIMIT[ip].append(now)
+    return True
+
   def _send_json(self, code, data):
     self.send_response(code)
     self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -263,6 +280,9 @@ class CFIHandler(BaseHTTPRequestHandler):
     return {}
 
   def do_GET(self):
+    if not self._check_rate_limit():
+      self._send_html(429, '<h1>429 - 请求过于频繁</h1><p>请稍后再试</p>')
+      return
     try:
       parsed = urllib.parse.urlparse(self.path)
       path = parsed.path.rstrip('/') or '/'
@@ -307,6 +327,7 @@ class CFIHandler(BaseHTTPRequestHandler):
         return;
 
       # Dynamic routes
+      if path == '/protected-download': self._render_protected_download(query); return
       if path.startswith('/plan/'): self._render_plan_detail(path[6:]); return
       if path.startswith('/article/'): self._render_article_detail(path[9:]); return
       if path.startswith('/report/'): self._render_report_detail(path[8:]); return
@@ -316,6 +337,9 @@ class CFIHandler(BaseHTTPRequestHandler):
       self._send_json(500, {'error': str(e)})
 
   def do_POST(self):
+    if not self._check_rate_limit():
+      self._send_json(429, {'error': 'rate limited'})
+      return
     try:
       parsed = urllib.parse.urlparse(self.path)
       path = parsed.path.rstrip('/') or '/'
@@ -352,8 +376,21 @@ class CFIHandler(BaseHTTPRequestHandler):
     full = os.path.normpath(full)
     if not full.startswith(os.path.normpath(BASE_DIR)):
       self._send_json(403, {'error': 'forbidden'}); return
+    # Prevent directory listing
+    if os.path.isdir(full):
+      self._send_html(403, '<h1>403 Forbidden</h1>')
+      return
     if not os.path.isfile(full):
       self._send_json(404, {'error': 'not found'}); return
+    # Log PDF downloads
+    if filepath.lower().endswith('.pdf'):
+      ip = self.client_address[0]
+      ua = self.headers.get('User-Agent', 'unknown')[:80]
+      t = time.strftime('%Y-%m-%d %H:%M:%S')
+      DOWNLOAD_LOG.append({'time': t, 'ip': ip, 'file': os.path.basename(filepath), 'ua': ua})
+      if len(DOWNLOAD_LOG) > 1000:
+        DOWNLOAD_LOG.pop(0)
+      print(f'[DL] {t} {ip} - {os.path.basename(filepath)}')
     ext = os.path.splitext(full)[1].lower()
     mime = MIME_TYPES.get(ext, 'application/octet-stream')
     self.send_response(200)
@@ -524,11 +561,11 @@ class CFIHandler(BaseHTTPRequestHandler):
     h = page_header('研究成果') + '<div class="container"><div class="page-header"><h1>研究成果</h1></div>'
     h += '<h2>研究报告</h2><div class="card-grid">'
     for r in research:
-      pdf = f' <a href="/uploads/{esc(r["pdf_filename"])}" class="tag">PDF下载</a>' if r.get('pdf_filename') else ''
+      pdf = f' <a href="/protected-download?file={esc(r["pdf_filename"])}" class="tag">PDF下载</a>' if r.get('pdf_filename') else ''
       h += f'<article class="card"><h3 class="card-title"><a href="/report/{esc(r["slug"])}">{esc(r["title"])}</a></h3><p class="card-summary">{esc(r.get("summary",""))}</p><div class="card-meta">{esc(r["created_at"][:10])} {render_tags(r.get("tags",""))}{pdf}</div></article>'
     h += '</div><h2>残障生命故事</h2><div class="card-grid">'
     for r in stories:
-      pdf = f' <a href="/uploads/{esc(r["pdf_filename"])}" class="tag">PDF下载</a>' if r.get('pdf_filename') else ''
+      pdf = f' <a href="/protected-download?file={esc(r["pdf_filename"])}" class="tag">PDF下载</a>' if r.get('pdf_filename') else ''
       h += f'<article class="card"><h3 class="card-title"><a href="/report/{esc(r["slug"])}">{esc(r["title"])}</a></h3><p class="card-summary">{esc(r.get("summary",""))}</p><div class="card-meta">{esc(r["created_at"][:10])} {render_tags(r.get("tags",""))}{pdf}</div></article>'
     h += '</div></div>' + page_footer()
     self._send_html(200, h)
@@ -670,6 +707,23 @@ class CFIHandler(BaseHTTPRequestHandler):
     h += '<div>' + (a.get('content') or esc(a.get('summary',''))) + '</div></article></div>' + page_footer()
     self._send_html(200, h)
 
+  def _render_protected_download(self, q):
+    pdf = q.get('file', '')
+    if not pdf or '..' in pdf or '/' in pdf:
+      self._send_html(400, '<h1>400 - 无效的文件请求</h1>'); return
+    # Show a form before allowing download
+    h = page_header('下载确认') + '<div class="container" style="max-width:600px;margin:80px auto;"><div class="card" style="padding:40px;">'
+    h += '<h2>研究成果下载</h2>'
+    h += '<p style="margin:16px 0;color:var(--color-secondary);">感谢您对酷残未来研究院的关注。请留下您的联系信息，我们将后续向您推送相关研究动态。</p>'
+    h += '<form method="post" action="/protected-download">'
+    h += '<input type="hidden" name="file" value="' + esc(pdf) + '">'
+    h += '<div class="admin-form-group"><label>姓名</label><input type="text" name="name" required placeholder="您的姓名"></div>'
+    h += '<div class="admin-form-group"><label>邮箱</label><input type="email" name="email" required placeholder="您的邮箱"></div>'
+    h += '<div class="admin-form-group"><label>机构（选填）</label><input type="text" name="org" placeholder="机构/团队名称"></div>'
+    h += '<button type="submit" class="admin-btn admin-btn-primary" style="width:100%;padding:12px;margin-top:8px;">确认下载</button>'
+    h += '</form></div></div>' + page_footer()
+    self._send_html(200, h)
+
   def _render_report_detail(self, slug):
     conn = get_db()
     r = conn.execute('SELECT * FROM reports WHERE slug=? AND is_published=1', (slug,)).fetchone()
@@ -677,7 +731,7 @@ class CFIHandler(BaseHTTPRequestHandler):
     if not r: self._send_html(404, '<h1>404 - 报告未找到</h1>'); return
     h = page_header(r['title']) + '<div class="container"><article class="content-body"><h1>' + esc(r['title']) + '</h1>'
     h += '<div class="article-meta">' + esc(r['created_at'][:10]) + ' ' + render_tags(r.get('tags','')) + '</div>'
-    pdf = '<a href="/uploads/' + esc(r['pdf_filename']) + '" class="tag">PDF下载</a>' if r.get('pdf_filename') else ''
+    pdf = '<a href="/protected-download?file=' + esc(r['pdf_filename']) + '" class="tag">PDF下载</a>' if r.get('pdf_filename') else ''
     h += pdf + '<div>' + (r.get('content') or esc(r.get('summary',''))) + '</div></article></div>' + page_footer()
     self._send_html(200, h)
 
